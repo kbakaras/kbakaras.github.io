@@ -2,7 +2,7 @@
 layout: post
 title:  "Настройка валидации DataSource в Wildfly"
 date:   2019-07-09 12:30:00 +0300
-categories: wildfly datasource
+tags: wildfly datasource
 ---
 
 ## Суть проблемы
