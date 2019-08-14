@@ -1,12 +1,75 @@
 ---
 layout: post
-title:  "Интерсепторы EJB и Транзакция"
+title:  "Интерцепторы EJB и Транзакция"
 date:   2019-08-13
 tags: wildfly ejb transaction interceptor
 ---
 
+## Цель заметки
+
+1. Объяснить, как EJB-интерцепторы взаимодействуют с управляемыми контейнером транзакциями.
+
+2. Рассказать о подписке на события завершения транзакции, что в некоторых случаях можно использовать в качестве даже более подходящей альтернативы интерцепторам.
+
+## Пример задачи
+
+Необходимо организовать логирование событий, связанных с изменением и записью в БД некоторых сущностей. Несколько ключевых требований к логированию:
+
+* В логе необходимо подробно отражать состояние сущности и производимые в нём изменения.
+* В логе нужно отражать как успешные выполнения операций, так и неуспешные попытки.
+* По каждому событию изменения в логе должна возникать единственная запись, в которой будет отражена вся требуемая информация.
+
+Из перечисленных требований возникает ряд следствий. Во-первых, операции логирования инициироваться должны из методов, в которых производятся действия над нашими сущностями. Только там есть доступ ко всем подробностям их состояния. Во-вторых, если речь идёт об операции изменения (обновления), то нужно запоминать состояние сущности до изменения, а потом сопоставлять с состоянием после изменения.
+
+В-третьих, непосредственный вывод в журнал нужно выполнять только тогда, когда мы уже точно знаем, было ли изменение выполнено успешно, или же по какой-то причине оно было отклонено. Значит, выводить в лог в конце метода, изменяющего элемент сущности, мы не можем (напомню, у нас транзакциями управляет контейнер). И первое, что приходит на ум…
+
+## EJB-Интерцепторы
+
+["The Java EE 6 Tutorial"](https://docs.oracle.com/javaee/6/tutorial/doc/gkigq.html) в соответствующем разделе утверждает, что EJB-интерцепторы нужны для того, чтобы можно было перехватывать вызовы, направленные к управляемым EJB-объектам (бинам), обычно с целью логирования, профилирования или аудита. Вроде, то что нам нужно, но не совсем. А дело в транзакции.
+
+Как оказалось, интерцептор участвует в транзакции EJB, и разместить в нём операции вывода в лог в нашем случае нельзя. Ведь и в интерцепторе, даже после выхода из метода сервисного бина, мы не узнаем, успешно ли завершилась транзакция. И такое поведение вполне закономерно и даже логично. Транзакцией управляет контейнер, начаться она может (теоретически) в любом другом месте, не обязательно связанном именно с вызовом нашего сервиса, да и закончиться тоже.
+
+Попытки искусственно ограничить рамки транзакций только вызовами методов интересующих нас бинов тоже ничего не дадут: контейнер всё равно сперва начнёт транзакцию, а потом уже вызовет интерцептор. Закончится транзакция не после выхода из сервисного бина, а только после окончания работы метода интерцептора. Это поведение отражено в JavaDoc аннотации `@AroundInvoke`:
+
+> `@AroundInvoke` method invocations occur within the same transaction and security context as the method on which they are interposing.
+
+С точки зрения контейнера, управляющего транзакциями, интерцептор вместе с перехватываемым бином рассматриваются как одно целое. И в нашем случае это не подходит. Но решение, позволяющее выполнить все требования, всё-таки есть. И на мой взгляд, оно даже лучше использования интерцепторов.
+
+## Подписка на события завершения транзакции
+
+Решение нашлось в статье на Stackoverflow, ["EJB Interceptors and transaction lifecycle OR how to intercept a commit/failure event?"](https://stackoverflow.com/questions/28804586/ejb-interceptors-and-transaction-lifecycle-or-how-to-intercept-a-commit-failure) Там тоже рассуждали больше про интерцепторы, а предложенный вариант даже не отметили в качестве решения. Но именно оно-то и подходит в нашем случае как нельзя лучше. Суть достаточно проста: нужно подписаться на событие завершения транзакции, при наступлении которого и можно узнать, была ли транзакция фактически подтверждена или отклонена. Вот как это выглядит в коде:
+
+```java
+// Инжектим менеджер транзакций (он один на весь сервер приложений)
+@Resource(lookup = "java:/TransactionManager")
+private TransactionManager transactionManager;
+
+// Подписываемся на событие
+Transaction tx = transactionManager.getTransaction();
+tx.registerSynchronization(new Synchronization() {
+    public void beforeCompletion() {
+        // Выполняется до начала комита
+    }
+    public void afterCompletion(int status) {
+        // Выполняется после комита
+        if (status == Status.STATUS_COMMITTED) {
+            log.committed();
+        } else {
+            log.rejected();
+        }
+    }
+});
+```
+
+Реальная запись в лог будет осуществляться в методе `afterCompletion`, когда уже известен результат транзакции.
+
+Привлекательность этого подхода в том, что он не накладывает дополнительных ограничений на то, как будут организованы вызовы транзакционных методов. Например, можно будет сделать несколько записей в лог для нескольких изменяемых сущностей, даже если всё это окажется в одной транзакции. И единственное, что нужно для этого сделать – подписаться на событие завершения транзакции в тех методах, где будут происходить изменения интересующих нас элементов.
+
+Одно ограничение всё-таки есть: нужно чтобы была активная транзакция. Но для изменения сущностей иначе быть и не может. А если возникнет необходимость журналирования событий, происходящих вне транзакции, можно будет воспользоваться интерцепторами.
+
 ## Дополнительные материалы
-1. [https://docs.oracle.com/javaee/6/tutorial/doc/gkhjx.html](https://docs.oracle.com/javaee/6/tutorial/doc/gkhjx.html)
-2. [https://docs.oracle.com/javaee/6/tutorial/doc/gkigq.html](https://docs.oracle.com/javaee/6/tutorial/doc/gkigq.html)
-3. [https://stackoverflow.com/questions/18720485/do-java-ee-interceptors-take-part-in-container-managed-transactions-of-an-ejb](https://stackoverflow.com/questions/18720485/do-java-ee-interceptors-take-part-in-container-managed-transactions-of-an-ejb)
-4. [https://stackoverflow.com/questions/28804586/ejb-interceptors-and-transaction-lifecycle-or-how-to-intercept-a-commit-failure](https://stackoverflow.com/questions/28804586/ejb-interceptors-and-transaction-lifecycle-or-how-to-intercept-a-commit-failure)
+
+1. "The Java EE 6 Tutorial": [Using Interceptors in CDI Applications](https://docs.oracle.com/javaee/6/tutorial/doc/gkhjx.html).
+2. "The Java EE 6 Tutorial": [Using Java EE Interceptors. Overview of Interceptors](https://docs.oracle.com/javaee/6/tutorial/doc/gkigq.html).
+3. "Stackoverflow": [Do Java EE interceptors take part in container managed transactions of an EJB](https://stackoverflow.com/questions/18720485/do-java-ee-interceptors-take-part-in-container-managed-transactions-of-an-ejb).
+4. "Stackoverflow": [EJB Interceptors and transaction lifecycle OR how to intercept a commit/failure event?](https://stackoverflow.com/questions/28804586/ejb-interceptors-and-transaction-lifecycle-or-how-to-intercept-a-commit-failure)
