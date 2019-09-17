@@ -1,6 +1,6 @@
 ---
 layout: post
-title: "Универсальность или "многоцельность" (universality vs multipurpose)"
+title: "Универсальность или 'многоцельность' (universality vs multipurpose)"
 date: 2019-07-17 18:30:00 +0300
 tags: phylosophy programming
 ---
